@@ -9,3 +9,12 @@ dependencies = [
     "tqdm>=4.70.1",
     "ultralytics>=8.4.178",
 ]
+
+[project.scripts]
+duckdb-ui = "scripts.duckdb_ui:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+packages = ["scripts"]

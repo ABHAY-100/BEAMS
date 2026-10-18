@@ -9,31 +9,77 @@ import cv2
 import duckdb
 import pandas as pd
 import torch
-
 from tqdm import tqdm
 from ultralytics import YOLO
 
-MODEL_PATH = "models/ExposureEngineEnhanced.pt"
+MODEL_PATH = "models/model_m.pt"
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
 DB_PATH = OUTPUT_DIR / "beams.duckdb"
-CONF = 0.5
+CONF = 0.25
 IMGSZ = 1280
 JPEG_QUALITY = 90
 SKIP_DONE = True
 WRITER_THREADS = 4
 
 DET_COLS = [
-    "video",
-    "frame",
-    "brand",
-    "confidence",
-    "center_x",
-    "center_y",
-    "box_width",
-    "box_height",
-    "angle_deg",
+    "video", "frame", "brand", "confidence",
+    "center_x", "center_y", "box_width", "box_height", "angle_deg",
 ]
+
+
+METRICS_VIEW = """
+    CREATE OR REPLACE VIEW brand_metrics AS
+    WITH per_frame AS (
+        SELECT d.video, d.frame, d.brand,
+               COUNT(*) AS boxes,
+               SUM(100.0 * d.box_width * d.box_height / (v.width * v.height)) AS coverage
+        FROM detections d
+        JOIN videos v USING (video)
+        GROUP BY d.video, d.frame, d.brand
+    ),
+    brands_in_frame AS (
+        SELECT video, frame, COUNT(*) AS n_brands
+        FROM per_frame
+        GROUP BY video, frame
+    ),
+    agg AS (
+        SELECT p.video, p.brand,
+               COUNT(*) AS frames,
+               SUM(p.boxes)::BIGINT AS detections,
+               AVG(p.coverage) AS avg_coverage,
+               MAX(p.coverage) AS max_coverage,
+               SUM(p.coverage) AS coverage_total,
+               COUNT(*) FILTER (WHERE b.n_brands = 1) AS solo_frames
+        FROM per_frame p
+        JOIN brands_in_frame b USING (video, frame)
+        GROUP BY p.video, p.brand
+    ),
+    conf AS (
+        SELECT video, brand, AVG(confidence) AS avg_confidence
+        FROM detections
+        GROUP BY video, brand
+    )
+    SELECT a.video,
+           v.file_name,
+           v.duration,
+           v.fps,
+           round(v.fps * v.duration)::INTEGER AS total_frames,
+           a.brand,
+           a.detections,
+           a.frames,
+           a.frames / v.fps AS screen_time,
+           100.0 * a.frames / round(v.fps * v.duration) AS percentage,
+           a.detections * 1.0 / a.frames AS avg_per_frame,
+           a.avg_coverage,
+           a.max_coverage,
+           a.solo_frames / v.fps AS solo_time,
+           100.0 * a.coverage_total / SUM(a.coverage_total) OVER (PARTITION BY a.video) AS share_of_voice,
+           c.avg_confidence
+    FROM agg a
+    JOIN videos v USING (video)
+    JOIN conf c USING (video, brand)
+"""
 
 
 def init_db(con):
@@ -60,6 +106,7 @@ def init_db(con):
             angle_deg  DOUBLE
         )
     """)
+    con.execute(METRICS_VIEW)
 
 
 def make_id(video):
@@ -94,10 +141,7 @@ def save_video(con, vid, file_name, fps, duration, width, height, rows):
 
 def process_video(model, con, pool, video):
     vid = make_id(video)
-    if (
-        SKIP_DONE
-        and con.execute("SELECT 1 FROM videos WHERE video = ?", [vid]).fetchone()
-    ):
+    if SKIP_DONE and con.execute("SELECT 1 FROM videos WHERE video = ?", [vid]).fetchone():
         return 0
 
     out_dir = OUTPUT_DIR / vid
@@ -113,7 +157,7 @@ def process_video(model, con, pool, video):
         stream=True,
         conf=CONF,
         imgsz=IMGSZ,
-        half=torch.cuda.is_available(),
+        quantize=16 if torch.cuda.is_available() else 32,
         verbose=False,
     )
 
@@ -138,19 +182,11 @@ def process_video(model, con, pool, video):
         for cls_id, conf, (cx, cy, w, h, ang) in zip(
             r.obb.cls.tolist(), r.obb.conf.tolist(), r.obb.xywhr.tolist()
         ):
-            rows.append(
-                (
-                    vid,
-                    name,
-                    model.names[int(cls_id)],
-                    round(conf, 4),
-                    round(cx, 1),
-                    round(cy, 1),
-                    round(w, 1),
-                    round(h, 1),
-                    round(math.degrees(ang), 1),
-                )
-            )
+            rows.append((
+                vid, name, model.names[int(cls_id)],
+                round(conf, 4), round(cx, 1), round(cy, 1),
+                round(w, 1), round(h, 1), round(math.degrees(ang), 1),
+            ))
 
     bar.close()
     for f in pending:
@@ -167,19 +203,7 @@ def process_video(model, con, pool, video):
 
 
 def main():
-    exts = {
-        ".mp4",
-        ".mkv",
-        ".webm",
-        ".avi",
-        ".mov",
-        ".flv",
-        ".wmv",
-        ".m4v",
-        ".mpg",
-        ".mpeg",
-        ".ts",
-    }
+    exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".ts"}
     if not INPUT_DIR.is_dir():
         print("Input folder not found:", INPUT_DIR)
         return
